@@ -12,8 +12,10 @@ import supersuit as ss
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import torch.nn.functional as F
 from torch.distributions.categorical import Categorical
 from torch.utils.tensorboard import SummaryWriter
+from pettingzoo.atari.base_atari_env import ParallelAtariEnv
 
 
 def parse_args():
@@ -35,6 +37,12 @@ def parse_args():
         help="the entity (team) of wandb's project")
     parser.add_argument("--capture-video", type=lambda x: bool(strtobool(x)), default=False, nargs="?", const=True,
         help="weather to capture videos of the agent performances (check out `videos` folder)")
+    parser.add_argument("--use-evaluation", type=lambda x: bool(strtobool(x)), default=True, nargs="?", const=True,
+        help="if toggled, periodically run evaluation episodes")
+    parser.add_argument("--evaluation-interval", type=int, default=int(2**16),
+        help="how often to run evaluations on test environment")
+    parser.add_argument("--evaluation-num-episodes", type=int, default=16,
+        help="how many episodes to run in test environment per evaluation epoch")
 
     # Algorithm specific arguments
     parser.add_argument("--env-id", type=str, default="pong_v3",
@@ -148,27 +156,74 @@ if __name__ == "__main__":
 
     device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
 
+    def AtariAgentIndicator(env):
+        def modify_obs(obs, obs_space, agent):
+            num_agents = 2  # len(env.possible_agents)
+            agent_idx = env.possible_agents.index(agent)
+            indicator_flat = F.one_hot(torch.tensor(agent_idx), num_classes=num_agents)
+
+            obs_shape = obs.shape[:-1]
+            indicator = indicator_flat.reshape((1, 1, num_agents)).repeat(*obs_shape, 1).numpy()
+            assert indicator.shape == (84, 84, 2)
+
+            return np.concatenate((obs, indicator), axis=-1)
+
+        env = ss.observation_lambda_v0(env, modify_obs)
+        env = ss.pad_observations_v0(env)
+        return env
+
     # env setup
-    env = importlib.import_module(f"pettingzoo.atari.{args.env_id}").parallel_env()
-    env = ss.max_observation_v0(env, 2)
-    env = ss.frame_skip_v0(env, 4)
-    env = ss.clip_reward_v0(env, lower_bound=-1, upper_bound=1)
-    env = ss.color_reduction_v0(env, mode="B")
-    env = ss.resize_v1(env, x_size=84, y_size=84)
-    env = ss.frame_stack_v1(env, 4)
-    env = ss.agent_indicator_v0(env, type_only=False)
-    env = ss.pettingzoo_env_to_vec_env_v1(env)
-    envs = ss.concat_vec_envs_v1(env, args.num_envs // 2, num_cpus=0, base_class="gym")
-    envs.single_observation_space = envs.observation_space
-    envs.single_action_space = envs.action_space
-    envs.is_vector_env = True
-    envs = gym.wrappers.RecordEpisodeStatistics(envs)
-    if args.capture_video:
-        envs = gym.wrappers.RecordVideo(envs, f"videos/{run_name}")
-    assert isinstance(envs.single_action_space, gym.spaces.Discrete), "only discrete action space is supported"
+    def create_envs(test=False):
+        if test:
+            name_no_version = args.env_id.rsplit("_", 1)[0]
+            env = ParallelAtariEnv(game=name_no_version, num_players=1)
+        else:
+            env = importlib.import_module(f"pettingzoo.atari.{args.env_id}").parallel_env()
+        env = ss.max_observation_v0(env, 2)
+        env = ss.frame_skip_v0(env, 4)
+        env = ss.clip_reward_v0(env, lower_bound=-1, upper_bound=1)
+        env = ss.color_reduction_v0(env, mode="B")
+        env = ss.resize_v1(env, x_size=84, y_size=84)
+        env = ss.frame_stack_v1(env, 4)
+        env = AtariAgentIndicator(env)
+        env = ss.pettingzoo_env_to_vec_env_v1(env)
+        envs = ss.concat_vec_envs_v1(env, args.num_envs // 2, num_cpus=0, base_class="gym")
+        envs.single_observation_space = envs.observation_space
+        envs.single_action_space = envs.action_space
+        envs.is_vector_env = True
+        envs = gym.wrappers.RecordEpisodeStatistics(envs)
+        if args.capture_video:
+            envs = gym.wrappers.RecordVideo(envs, f"videos/{run_name}")
+        assert isinstance(envs.single_action_space, gym.spaces.Discrete), "only discrete action space is supported"
+        return envs
+
+    envs = create_envs(test=False)
+    test_envs = create_envs(test=True)
 
     agent = Agent(envs).to(device)
     optimizer = optim.Adam(agent.parameters(), lr=args.learning_rate, eps=1e-5)
+
+    @torch.no_grad()
+    def eval_runs(step: int):
+        if step == 0 or step % args.evaluation_interval > 0:
+            return
+
+        eval_dones = 0
+        next_obs = torch.Tensor(test_envs.reset()).to(device)
+        while eval_dones < args.evaluation_num_episodes:
+
+            with torch.no_grad():
+                action, _, _, value = agent.get_action_and_value(next_obs)
+
+            next_obs, reward, next_done, info = test_envs.step(action.cpu().numpy())
+            eval_dones += sum(next_done)
+            next_obs = torch.Tensor(next_obs).to(device)
+
+            for idx, item in enumerate(info):
+                if "episode" in item.keys():
+                    print(f"global_step={step}, eval_episodic_return={item['episode']['r']}")
+                    writer.add_scalar(f"charts/eval_episodic_return", item["episode"]["r"], step)
+                    writer.add_scalar(f"charts/eval_episodic_length", item["episode"]["l"], step)
 
     # ALGO Logic: Storage setup
     obs = torch.zeros((args.num_steps, args.num_envs) + envs.single_observation_space.shape).to(device)
@@ -193,6 +248,8 @@ if __name__ == "__main__":
             optimizer.param_groups[0]["lr"] = lrnow
 
         for step in range(0, args.num_steps):
+            eval_runs(step=global_step)
+
             global_step += 1 * args.num_envs
             obs[step] = next_obs
             dones[step] = next_done
