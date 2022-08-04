@@ -19,12 +19,18 @@ if __name__ == "__main__":
         save_code=True,
     )
     target_scores = {
-        # "HalfCheetah-v4": 8000,
-        # "Walker2d-v4": 6000,
-        # "Ant-v4": 6000,
-        "pong_v3": None
+        "pong_v3": None,
+        # "double_dunk_v3": None,
+        # "ice_hockey_v2": None,
+        # "tennis_v3": None,
+        # "boxing_v2": None,
+        # "surround_v2": None,
     }
-    num_seeds = 3
+    print('ARGV:', sys.argv)
+    total_runs = 4
+    concurrent_runs = 2
+    num_seeds = total_runs // concurrent_runs  # may be remainder
+
     main_args = copy.deepcopy(sys.argv)
     scores = []
     for env in target_scores.keys():
